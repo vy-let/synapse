@@ -369,7 +369,7 @@ class FederationServer(FederationBase):
             logger.warn("Room version %s not in %s", room_version, supported_versions)
             raise IncompatibleRoomVersionError(room_version=room_version)
 
-        pdu = yield self.handler.on_make_join_request(room_id, user_id)
+        pdu = yield self.handler.on_make_join_request(origin, room_id, user_id)
         time_now = self._clock.time_msec()
         defer.returnValue(
             {"event": pdu.get_pdu_json(time_now), "room_version": room_version}
