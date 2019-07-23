@@ -423,7 +423,7 @@ class FederationServer(FederationBase):
     def on_make_leave_request(self, origin, room_id, user_id):
         origin_host, _ = parse_server_name(origin)
         yield self.check_server_matches_acl(origin_host, room_id)
-        pdu = yield self.handler.on_make_leave_request(room_id, user_id)
+        pdu = yield self.handler.on_make_leave_request(origin, room_id, user_id)
 
         room_version = yield self.store.get_room_version(room_id)
 
