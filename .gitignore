@@ -21,6 +21,7 @@ _trial_temp*/
 /homeserver*.yaml
 /media_store/
 /uploads
+/data
 
 # IDEs
 /.idea/
@@ -37,4 +38,3 @@ _trial_temp*/
 /docs/build/
 /htmlcov
 /pip-wheel-metadata/
-

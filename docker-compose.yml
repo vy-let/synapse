@@ -1,0 +1,55 @@
+version: '3.5'
+
+services:
+  app:
+    restart: always
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+
+    networks:
+      - synapse_internal
+      - synapse_external
+    ports:
+      - "127.0.0.1:8008:8008"
+
+    depends_on:
+      - db
+
+    volumes:
+      - ./data/app:/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "100k"
+        max-file: "150"
+        mode: non-blocking
+
+
+
+  db:
+    restart: always
+    image: postgres:9.6-alpine
+    networks:
+      - synapse_internal
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "1k"
+        max-file: "10"
+        mode: non-blocking
+    env_file: .env.db
+
+
+
+
+networks:
+  synapse_external:
+
+  synapse_internal:
+    internal: true
