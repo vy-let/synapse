@@ -1,5 +1,6 @@
 # Copyright 2015, 2016 OpenMarket Ltd
 # Copyright 2017 New Vector Ltd
+# Copyright 2019 The Matrix.org Foundation C.I.C.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -244,9 +245,27 @@ BASE_APPEND_OVERRIDE_RULES = [
                 "key": "type",
                 "pattern": "m.room.tombstone",
                 "_id": "_tombstone",
-            }
+            },
+            {
+                "kind": "event_match",
+                "key": "state_key",
+                "pattern": "",
+                "_id": "_tombstone_statekey",
+            },
         ],
         "actions": ["notify", {"set_tweak": "highlight", "value": True}],
+    },
+    {
+        "rule_id": "global/override/.m.rule.reaction",
+        "conditions": [
+            {
+                "kind": "event_match",
+                "key": "type",
+                "pattern": "m.reaction",
+                "_id": "_reaction",
+            }
+        ],
+        "actions": ["dont_notify"],
     },
 ]
 

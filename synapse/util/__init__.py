@@ -15,13 +15,12 @@
 
 import logging
 import re
-from itertools import islice
 
 import attr
 
 from twisted.internet import defer, task
 
-from synapse.util.logcontext import PreserveLoggingContext
+from synapse.logging import context
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +45,10 @@ class Clock(object):
     @defer.inlineCallbacks
     def sleep(self, seconds):
         d = defer.Deferred()
-        with PreserveLoggingContext():
+        with context.PreserveLoggingContext():
             self._reactor.callLater(seconds, d.callback, seconds)
             res = yield d
-        defer.returnValue(res)
+        return res
 
     def time(self):
         """Returns the current system time in seconds since epoch."""
@@ -59,7 +58,7 @@ class Clock(object):
         """Returns the current system time in miliseconds since epoch."""
         return int(self.time() * 1000)
 
-    def looping_call(self, f, msec):
+    def looping_call(self, f, msec, *args, **kwargs):
         """Call a function repeatedly.
 
         Waits `msec` initially before calling `f` for the first time.
@@ -70,8 +69,10 @@ class Clock(object):
         Args:
             f(function): The function to call repeatedly.
             msec(float): How long to wait between calls in milliseconds.
+            *args: Postional arguments to pass to function.
+            **kwargs: Key arguments to pass to function.
         """
-        call = task.LoopingCall(f)
+        call = task.LoopingCall(f, *args, **kwargs)
         call.clock = self._reactor
         d = call.start(msec / 1000.0, now=False)
         d.addErrback(log_failure, "Looping call died", consumeErrors=False)
@@ -91,10 +92,10 @@ class Clock(object):
         """
 
         def wrapped_callback(*args, **kwargs):
-            with PreserveLoggingContext():
+            with context.PreserveLoggingContext():
                 callback(*args, **kwargs)
 
-        with PreserveLoggingContext():
+        with context.PreserveLoggingContext():
             return self._reactor.callLater(delay, wrapped_callback, *args, **kwargs)
 
     def cancel_call_later(self, timer, ignore_errs=False):
@@ -103,22 +104,6 @@ class Clock(object):
         except Exception:
             if not ignore_errs:
                 raise
-
-
-def batch_iter(iterable, size):
-    """batch an iterable up into tuples with a maximum size
-
-    Args:
-        iterable (iterable): the iterable to slice
-        size (int): the maximum batch size
-
-    Returns:
-        an iterator over the chunks
-    """
-    # make sure we can deal with iterables like lists too
-    sourceiter = iter(iterable)
-    # call islice until it returns an empty tuple
-    return iter(lambda: tuple(islice(sourceiter, size)), ())
 
 
 def log_failure(failure, msg, consumeErrors=True):

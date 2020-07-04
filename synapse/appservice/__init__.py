@@ -94,7 +94,9 @@ class ApplicationService(object):
         ip_range_whitelist=None,
     ):
         self.token = token
-        self.url = url
+        self.url = (
+            url.rstrip("/") if isinstance(url, str) else None
+        )  # url must not end with a slash
         self.hs_token = hs_token
         self.sender = sender
         self.server_name = hostname
@@ -175,21 +177,21 @@ class ApplicationService(object):
     @defer.inlineCallbacks
     def _matches_user(self, event, store):
         if not event:
-            defer.returnValue(False)
+            return False
 
         if self.is_interested_in_user(event.sender):
-            defer.returnValue(True)
+            return True
         # also check m.room.member state key
         if event.type == EventTypes.Member and self.is_interested_in_user(
             event.state_key
         ):
-            defer.returnValue(True)
+            return True
 
         if not store:
-            defer.returnValue(False)
+            return False
 
         does_match = yield self._matches_user_in_member_list(event.room_id, store)
-        defer.returnValue(does_match)
+        return does_match
 
     @cachedInlineCallbacks(num_args=1, cache_context=True)
     def _matches_user_in_member_list(self, room_id, store, cache_context):
@@ -200,8 +202,8 @@ class ApplicationService(object):
         # check joined member events
         for user_id in member_list:
             if self.is_interested_in_user(user_id):
-                defer.returnValue(True)
-        defer.returnValue(False)
+                return True
+        return False
 
     def _matches_room_id(self, event):
         if hasattr(event, "room_id"):
@@ -211,13 +213,13 @@ class ApplicationService(object):
     @defer.inlineCallbacks
     def _matches_aliases(self, event, store):
         if not store or not event:
-            defer.returnValue(False)
+            return False
 
         alias_list = yield store.get_aliases_for_room(event.room_id)
         for alias in alias_list:
             if self.is_interested_in_alias(alias):
-                defer.returnValue(True)
-        defer.returnValue(False)
+                return True
+        return False
 
     @defer.inlineCallbacks
     def is_interested(self, event, store=None):
@@ -231,15 +233,15 @@ class ApplicationService(object):
         """
         # Do cheap checks first
         if self._matches_room_id(event):
-            defer.returnValue(True)
+            return True
 
         if (yield self._matches_aliases(event, store)):
-            defer.returnValue(True)
+            return True
 
         if (yield self._matches_user(event, store)):
-            defer.returnValue(True)
+            return True
 
-        defer.returnValue(False)
+        return False
 
     def is_interested_in_user(self, user_id):
         return (
@@ -268,7 +270,7 @@ class ApplicationService(object):
     def is_exclusive_room(self, room_id):
         return self._is_exclusive(ApplicationService.NS_ROOMS, room_id)
 
-    def get_exlusive_user_regexes(self):
+    def get_exclusive_user_regexes(self):
         """Get the list of regexes used to determine if a user is exclusively
         registered by the AS
         """

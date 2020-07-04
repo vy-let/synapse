@@ -17,8 +17,6 @@ import base64
 import hashlib
 import hmac
 
-from twisted.internet import defer
-
 from synapse.http.servlet import RestServlet
 from synapse.rest.client.v2_alpha._base import client_patterns
 
@@ -31,9 +29,8 @@ class VoipRestServlet(RestServlet):
         self.hs = hs
         self.auth = hs.get_auth()
 
-    @defer.inlineCallbacks
-    def on_GET(self, request):
-        requester = yield self.auth.get_user_by_req(
+    async def on_GET(self, request):
+        requester = await self.auth.get_user_by_req(
             request, self.hs.config.turn_allow_guests
         )
 
@@ -60,22 +57,20 @@ class VoipRestServlet(RestServlet):
             password = turnPassword
 
         else:
-            defer.returnValue((200, {}))
+            return 200, {}
 
-        defer.returnValue(
-            (
-                200,
-                {
-                    "username": username,
-                    "password": password,
-                    "ttl": userLifetime / 1000,
-                    "uris": turnUris,
-                },
-            )
+        return (
+            200,
+            {
+                "username": username,
+                "password": password,
+                "ttl": userLifetime / 1000,
+                "uris": turnUris,
+            },
         )
 
     def on_OPTIONS(self, request):
-        return (200, {})
+        return 200, {}
 
 
 def register_servlets(hs, http_server):

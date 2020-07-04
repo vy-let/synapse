@@ -32,11 +32,12 @@ def client_patterns(path_regex, releases=(0,), unstable=True, v1=False):
 
     Args:
         path_regex (str): The regex string to match. This should NOT have a ^
-        as this will be prefixed.
+            as this will be prefixed.
     Returns:
         SRE_Pattern
     """
     patterns = []
+
     if unstable:
         unstable_prefix = CLIENT_API_PREFIX + "/unstable"
         patterns.append(re.compile("^" + unstable_prefix + path_regex))
@@ -46,6 +47,7 @@ def client_patterns(path_regex, releases=(0,), unstable=True, v1=False):
     for release in releases:
         new_prefix = CLIENT_API_PREFIX + "/r%d" % (release,)
         patterns.append(re.compile("^" + new_prefix + path_regex))
+
     return patterns
 
 
@@ -76,7 +78,7 @@ def interactive_auth_handler(orig):
             """
 
     def wrapped(*args, **kwargs):
-        res = defer.maybeDeferred(orig, *args, **kwargs)
+        res = defer.ensureDeferred(orig(*args, **kwargs))
         res.addErrback(_catch_incomplete_interactive_auth)
         return res
 

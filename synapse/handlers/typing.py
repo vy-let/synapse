@@ -15,13 +15,14 @@
 
 import logging
 from collections import namedtuple
+from typing import List
 
 from twisted.internet import defer
 
 from synapse.api.errors import AuthError, SynapseError
+from synapse.logging.context import run_in_background
 from synapse.types import UserID, get_domain_from_id
 from synapse.util.caches.stream_change_cache import StreamChangeCache
-from synapse.util.logcontext import run_in_background
 from synapse.util.metrics import Measure
 from synapse.util.wheel_timer import WheelTimer
 
@@ -83,7 +84,7 @@ class TypingHandler(object):
         self._room_typing = {}
 
     def _handle_timeouts(self):
-        logger.info("Checking for typing timeouts")
+        logger.debug("Checking for typing timeouts")
 
         now = self.clock.time_msec()
 
@@ -120,12 +121,12 @@ class TypingHandler(object):
         auth_user_id = auth_user.to_string()
 
         if not self.is_mine_id(target_user_id):
-            raise SynapseError(400, "User is not hosted on this Home Server")
+            raise SynapseError(400, "User is not hosted on this homeserver")
 
         if target_user_id != auth_user_id:
             raise AuthError(400, "Cannot set another user's typing state")
 
-        yield self.auth.check_joined_room(room_id, target_user_id)
+        yield self.auth.check_user_in_room(room_id, target_user_id)
 
         logger.debug("%s has started typing in %s", target_user_id, room_id)
 
@@ -140,7 +141,7 @@ class TypingHandler(object):
 
         if was_present:
             # No point sending another notification
-            defer.returnValue(None)
+            return None
 
         self._push_update(member=member, typing=True)
 
@@ -150,12 +151,12 @@ class TypingHandler(object):
         auth_user_id = auth_user.to_string()
 
         if not self.is_mine_id(target_user_id):
-            raise SynapseError(400, "User is not hosted on this Home Server")
+            raise SynapseError(400, "User is not hosted on this homeserver")
 
         if target_user_id != auth_user_id:
             raise AuthError(400, "Cannot set another user's typing state")
 
-        yield self.auth.check_joined_room(room_id, target_user_id)
+        yield self.auth.check_user_in_room(room_id, target_user_id)
 
         logger.debug("%s has stopped typing in %s", target_user_id, room_id)
 
@@ -173,7 +174,7 @@ class TypingHandler(object):
     def _stopped_typing(self, member):
         if member.user_id not in self._room_typing.get(member.room_id, set()):
             # No point
-            defer.returnValue(None)
+            return None
 
         self._member_typing_until.pop(member, None)
         self._member_last_federation_poke.pop(member, None)
@@ -198,7 +199,7 @@ class TypingHandler(object):
                 now=now, obj=member, then=now + FEDERATION_PING_INTERVAL
             )
 
-            for domain in set(get_domain_from_id(u) for u in users):
+            for domain in {get_domain_from_id(u) for u in users}:
                 if domain != self.server_name:
                     logger.debug("sending typing update to %s", domain)
                     self.federation.build_and_send_edu(
@@ -231,7 +232,7 @@ class TypingHandler(object):
             return
 
         users = yield self.state.get_current_users_in_room(room_id)
-        domains = set(get_domain_from_id(u) for u in users)
+        domains = {get_domain_from_id(u) for u in users}
 
         if self.server_name in domains:
             logger.info("Got typing update from %s: %r", user_id, content)
@@ -257,7 +258,13 @@ class TypingHandler(object):
             "typing_key", self._latest_room_serial, rooms=[member.room_id]
         )
 
-    def get_all_typing_updates(self, last_id, current_id):
+    async def get_all_typing_updates(
+        self, last_id: int, current_id: int, limit: int
+    ) -> List[dict]:
+        """Get up to `limit` typing updates between the given tokens, earliest
+        updates first.
+        """
+
         if last_id == current_id:
             return []
 
@@ -275,7 +282,7 @@ class TypingHandler(object):
                 typing = self._room_typing[room_id]
                 rows.append((serial, room_id, list(typing)))
         rows.sort()
-        return rows
+        return rows[:limit]
 
     def get_current_token(self):
         return self._latest_room_serial
@@ -313,10 +320,7 @@ class TypingNotificationEventSource(object):
 
                 events.append(self._make_event_for(room_id))
 
-            return events, handler._latest_room_serial
+            return defer.succeed((events, handler._latest_room_serial))
 
     def get_current_key(self):
         return self.get_typing_handler()._latest_room_serial
-
-    def get_pagination_rows(self, user, pagination_config, key):
-        return ([], pagination_config.from_key)

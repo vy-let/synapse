@@ -13,28 +13,51 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import functools
 import inspect
 import logging
 import threading
-from collections import namedtuple
+from typing import Any, Tuple, Union, cast
+from weakref import WeakValueDictionary
 
-import six
-from six import itervalues, string_types
+from six import itervalues
+
+from prometheus_client import Gauge
+from typing_extensions import Protocol
 
 from twisted.internet import defer
 
-from synapse.util import logcontext, unwrapFirstError
+from synapse.logging.context import make_deferred_yieldable, preserve_fn
+from synapse.util import unwrapFirstError
 from synapse.util.async_helpers import ObservableDeferred
-from synapse.util.caches import get_cache_factor_for
 from synapse.util.caches.lrucache import LruCache
 from synapse.util.caches.treecache import TreeCache, iterate_tree_cache_entry
-from synapse.util.stringutils import to_ascii
 
 from . import register_cache
 
 logger = logging.getLogger(__name__)
 
+CacheKey = Union[Tuple, Any]
+
+
+class _CachedFunction(Protocol):
+    invalidate = None  # type: Any
+    invalidate_all = None  # type: Any
+    invalidate_many = None  # type: Any
+    prefill = None  # type: Any
+    cache = None  # type: Any
+    num_args = None  # type: Any
+
+    def __name__(self):
+        ...
+
+
+cache_pending_metric = Gauge(
+    "synapse_util_caches_cache_pending",
+    "Number of lookups currently pending for this cache",
+    ["name"],
+)
 
 _CacheSentinel = object()
 
@@ -58,7 +81,6 @@ class CacheEntry(object):
 class Cache(object):
     __slots__ = (
         "cache",
-        "max_entries",
         "name",
         "keylen",
         "thread",
@@ -66,7 +88,29 @@ class Cache(object):
         "_pending_deferred_cache",
     )
 
-    def __init__(self, name, max_entries=1000, keylen=1, tree=False, iterable=False):
+    def __init__(
+        self,
+        name: str,
+        max_entries: int = 1000,
+        keylen: int = 1,
+        tree: bool = False,
+        iterable: bool = False,
+        apply_cache_factor_from_config: bool = True,
+    ):
+        """
+        Args:
+            name: The name of the cache
+            max_entries: Maximum amount of entries that the cache will hold
+            keylen: The length of the tuple used as the cache key
+            tree: Use a TreeCache instead of a dict as the underlying cache type
+            iterable: If True, count each item in the cached object as an entry,
+                rather than each cached object
+            apply_cache_factor_from_config: Whether cache factors specified in the
+                config file affect `max_entries`
+
+        Returns:
+            Cache
+        """
         cache_type = TreeCache if tree else dict
         self._pending_deferred_cache = cache_type()
 
@@ -76,15 +120,28 @@ class Cache(object):
             cache_type=cache_type,
             size_callback=(lambda d: len(d)) if iterable else None,
             evicted_callback=self._on_evicted,
+            apply_cache_factor_from_config=apply_cache_factor_from_config,
         )
 
         self.name = name
         self.keylen = keylen
         self.thread = None
-        self.metrics = register_cache("cache", name, self.cache)
+        self.metrics = register_cache(
+            "cache",
+            name,
+            self.cache,
+            collect_callback=self._metrics_collection_callback,
+        )
+
+    @property
+    def max_entries(self):
+        return self.cache.max_size
 
     def _on_evicted(self, evicted_count):
         self.metrics.inc_evictions(evicted_count)
+
+    def _metrics_collection_callback(self):
+        cache_pending_metric.labels(self.name).set(len(self._pending_deferred_cache))
 
     def check_thread(self):
         expected_thread = self.thread
@@ -107,7 +164,7 @@ class Cache(object):
             update_metrics (bool): whether to update the cache hit rate metrics
 
         Returns:
-            Either a Deferred or the raw result
+            Either an ObservableDeferred or the raw result
         """
         callbacks = [callback] if callback else []
         val = self._pending_deferred_cache.get(key, _CacheSentinel)
@@ -131,9 +188,14 @@ class Cache(object):
             return default
 
     def set(self, key, value, callback=None):
+        if not isinstance(value, defer.Deferred):
+            raise TypeError("not a Deferred")
+
         callbacks = [callback] if callback else []
         self.check_thread()
-        entry = CacheEntry(deferred=value, callbacks=callbacks)
+        observable = ObservableDeferred(value, consumeErrors=True)
+        observer = defer.maybeDeferred(observable.observe)
+        entry = CacheEntry(deferred=observable, callbacks=callbacks)
 
         existing_entry = self._pending_deferred_cache.pop(key, None)
         if existing_entry:
@@ -141,20 +203,31 @@ class Cache(object):
 
         self._pending_deferred_cache[key] = entry
 
-        def shuffle(result):
+        def compare_and_pop():
+            """Check if our entry is still the one in _pending_deferred_cache, and
+            if so, pop it.
+
+            Returns true if the entries matched.
+            """
             existing_entry = self._pending_deferred_cache.pop(key, None)
             if existing_entry is entry:
+                return True
+
+            # oops, the _pending_deferred_cache has been updated since
+            # we started our query, so we are out of date.
+            #
+            # Better put back whatever we took out. (We do it this way
+            # round, rather than peeking into the _pending_deferred_cache
+            # and then removing on a match, to make the common case faster)
+            if existing_entry is not None:
+                self._pending_deferred_cache[key] = existing_entry
+
+            return False
+
+        def cb(result):
+            if compare_and_pop():
                 self.cache.set(key, result, entry.callbacks)
             else:
-                # oops, the _pending_deferred_cache has been updated since
-                # we started our query, so we are out of date.
-                #
-                # Better put back whatever we took out. (We do it this way
-                # round, rather than peeking into the _pending_deferred_cache
-                # and then removing on a match, to make the common case faster)
-                if existing_entry is not None:
-                    self._pending_deferred_cache[key] = existing_entry
-
                 # we're not going to put this entry into the cache, so need
                 # to make sure that the invalidation callbacks are called.
                 # That was probably done when _pending_deferred_cache was
@@ -162,9 +235,16 @@ class Cache(object):
                 # `invalidate` being previously called, in which case it may
                 # not have been. Either way, let's double-check now.
                 entry.invalidate()
-            return result
 
-        entry.deferred.addCallback(shuffle)
+        def eb(_fail):
+            compare_and_pop()
+            entry.invalidate()
+
+        # once the deferred completes, we can move the entry from the
+        # _pending_deferred_cache to the real cache.
+        #
+        observer.addCallbacks(cb, eb)
+        return observable
 
     def prefill(self, key, value, callback=None):
         callbacks = [callback] if callback else []
@@ -207,7 +287,9 @@ class Cache(object):
 
 
 class _CacheDescriptorBase(object):
-    def __init__(self, orig, num_args, inlineCallbacks, cache_context=False):
+    def __init__(
+        self, orig: _CachedFunction, num_args, inlineCallbacks, cache_context=False
+    ):
         self.orig = orig
 
         if inlineCallbacks:
@@ -215,7 +297,7 @@ class _CacheDescriptorBase(object):
         else:
             self.function_to_call = orig
 
-        arg_spec = inspect.getargspec(orig)
+        arg_spec = inspect.getfullargspec(orig)
         all_args = arg_spec.args
 
         if "cache_context" in all_args:
@@ -288,7 +370,7 @@ class CacheDescriptor(_CacheDescriptorBase):
         def foo(self, key, cache_context):
             r1 = yield self.bar1(key, on_invalidate=cache_context.invalidate)
             r2 = yield self.bar2(key, on_invalidate=cache_context.invalidate)
-            defer.returnValue(r1 + r2)
+            return r1 + r2
 
     Args:
         num_args (int): number of positional arguments (excluding ``self`` and
@@ -314,13 +396,11 @@ class CacheDescriptor(_CacheDescriptorBase):
             cache_context=cache_context,
         )
 
-        max_entries = int(max_entries * get_cache_factor_for(orig.__name__))
-
         self.max_entries = max_entries
         self.tree = tree
         self.iterable = iterable
 
-    def __get__(self, obj, objtype=None):
+    def __get__(self, obj, owner):
         cache = Cache(
             name=self.orig.__name__,
             max_entries=self.max_entries,
@@ -366,7 +446,7 @@ class CacheDescriptor(_CacheDescriptorBase):
                 return tuple(get_cache_key_gen(args, kwargs))
 
         @functools.wraps(self.orig)
-        def wrapped(*args, **kwargs):
+        def _wrapped(*args, **kwargs):
             # If we're passed a cache_context then we'll want to call its invalidate()
             # whenever we are invalidated
             invalidate_callback = kwargs.pop("on_invalidate", None)
@@ -376,7 +456,7 @@ class CacheDescriptor(_CacheDescriptorBase):
             # Add our own `cache_context` to argument list if the wrapped function
             # has asked for one
             if self.add_cache_context:
-                kwargs["cache_context"] = _CacheContext(cache, cache_key)
+                kwargs["cache_context"] = _CacheContext.get_instance(cache, cache_key)
 
             try:
                 cached_result_d = cache.get(cache_key, callback=invalidate_callback)
@@ -384,11 +464,11 @@ class CacheDescriptor(_CacheDescriptorBase):
                 if isinstance(cached_result_d, ObservableDeferred):
                     observer = cached_result_d.observe()
                 else:
-                    observer = cached_result_d
+                    observer = defer.succeed(cached_result_d)
 
             except KeyError:
                 ret = defer.maybeDeferred(
-                    logcontext.preserve_fn(self.function_to_call), obj, *args, **kwargs
+                    preserve_fn(self.function_to_call), obj, *args, **kwargs
                 )
 
                 def onErr(f):
@@ -397,20 +477,12 @@ class CacheDescriptor(_CacheDescriptorBase):
 
                 ret.addErrback(onErr)
 
-                # If our cache_key is a string on py2, try to convert to ascii
-                # to save a bit of space in large caches. Py3 does this
-                # internally automatically.
-                if six.PY2 and isinstance(cache_key, string_types):
-                    cache_key = to_ascii(cache_key)
-
-                result_d = ObservableDeferred(ret, consumeErrors=True)
-                cache.set(cache_key, result_d, callback=invalidate_callback)
+                result_d = cache.set(cache_key, ret, callback=invalidate_callback)
                 observer = result_d.observe()
 
-            if isinstance(observer, defer.Deferred):
-                return logcontext.make_deferred_yieldable(observer)
-            else:
-                return observer
+            return make_deferred_yieldable(observer)
+
+        wrapped = cast(_CachedFunction, _wrapped)
 
         if self.num_args == 1:
             wrapped.invalidate = lambda key: cache.invalidate(key[0])
@@ -436,9 +508,8 @@ class CacheListDescriptor(_CacheDescriptorBase):
     Given a list of keys it looks in the cache to find any hits, then passes
     the list of missing keys to the wrapped function.
 
-    Once wrapped, the function returns either a Deferred which resolves to
-    the list of results, or (if all results were cached), just the list of
-    results.
+    Once wrapped, the function returns a Deferred which resolves to the list
+    of results.
     """
 
     def __init__(
@@ -526,7 +597,7 @@ class CacheListDescriptor(_CacheDescriptorBase):
                     missing.add(arg)
 
             if missing:
-                # we need an observable deferred for each entry in the list,
+                # we need a deferred for each entry in the list,
                 # which we put in the cache. Each deferred resolves with the
                 # relevant result for that key.
                 deferreds_map = {}
@@ -534,8 +605,7 @@ class CacheListDescriptor(_CacheDescriptorBase):
                     deferred = defer.Deferred()
                     deferreds_map[arg] = deferred
                     key = arg_to_cache_key(arg)
-                    observable = ObservableDeferred(deferred)
-                    cache.set(key, observable, callback=invalidate_callback)
+                    cache.set(key, deferred, callback=invalidate_callback)
 
                 def complete_all(res):
                     # the wrapped function has completed. It returns a
@@ -563,7 +633,7 @@ class CacheListDescriptor(_CacheDescriptorBase):
 
                 cached_defers.append(
                     defer.maybeDeferred(
-                        logcontext.preserve_fn(self.function_to_call), **args_to_call
+                        preserve_fn(self.function_to_call), **args_to_call
                     ).addCallbacks(complete_all, errback)
                 )
 
@@ -571,23 +641,47 @@ class CacheListDescriptor(_CacheDescriptorBase):
                 d = defer.gatherResults(cached_defers, consumeErrors=True).addCallbacks(
                     lambda _: results, unwrapFirstError
                 )
-                return logcontext.make_deferred_yieldable(d)
+                return make_deferred_yieldable(d)
             else:
-                return results
+                return defer.succeed(results)
 
         obj.__dict__[self.orig.__name__] = wrapped
 
         return wrapped
 
 
-class _CacheContext(namedtuple("_CacheContext", ("cache", "key"))):
-    # We rely on _CacheContext implementing __eq__ and __hash__ sensibly,
-    # which namedtuple does for us (i.e. two _CacheContext are the same if
-    # their caches and keys match). This is important in particular to
-    # dedupe when we add callbacks to lru cache nodes, otherwise the number
-    # of callbacks would grow.
-    def invalidate(self):
-        self.cache.invalidate(self.key)
+class _CacheContext:
+    """Holds cache information from the cached function higher in the calling order.
+
+    Can be used to invalidate the higher level cache entry if something changes
+    on a lower level.
+    """
+
+    _cache_context_objects = (
+        WeakValueDictionary()
+    )  # type: WeakValueDictionary[Tuple[Cache, CacheKey], _CacheContext]
+
+    def __init__(self, cache, cache_key):  # type: (Cache, CacheKey) -> None
+        self._cache = cache
+        self._cache_key = cache_key
+
+    def invalidate(self):  # type: () -> None
+        """Invalidates the cache entry referred to by the context."""
+        self._cache.invalidate(self._cache_key)
+
+    @classmethod
+    def get_instance(cls, cache, cache_key):  # type: (Cache, CacheKey) -> _CacheContext
+        """Returns an instance constructed with the given arguments.
+
+        A new instance is only created if none already exists.
+        """
+
+        # We make sure there are no identical _CacheContext instances. This is
+        # important in particular to dedupe when we add callbacks to lru cache
+        # nodes, otherwise the number of callbacks would grow.
+        return cls._cache_context_objects.setdefault(
+            (cache, cache_key), cls(cache, cache_key)
+        )
 
 
 def cached(

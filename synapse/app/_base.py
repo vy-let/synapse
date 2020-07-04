@@ -15,11 +15,14 @@
 
 import gc
 import logging
+import os
 import signal
+import socket
 import sys
 import traceback
 
 from daemonize import Daemonize
+from typing_extensions import NoReturn
 
 from twisted.internet import defer, error, reactor
 from twisted.protocols.tls import TLSMemoryBIOFactory
@@ -27,28 +30,30 @@ from twisted.protocols.tls import TLSMemoryBIOFactory
 import synapse
 from synapse.app import check_bind_error
 from synapse.crypto import context_factory
-from synapse.util import PreserveLoggingContext
+from synapse.logging.context import PreserveLoggingContext
 from synapse.util.async_helpers import Linearizer
 from synapse.util.rlimit import change_resource_limit
 from synapse.util.versionstring import get_version_string
 
 logger = logging.getLogger(__name__)
 
+# list of tuples of function, args list, kwargs dict
 _sighup_callbacks = []
 
 
-def register_sighup(func):
+def register_sighup(func, *args, **kwargs):
     """
     Register a function to be called when a SIGHUP occurs.
 
     Args:
         func (function): Function to be called when sent a SIGHUP signal.
-            Will be called with a single argument, the homeserver.
+            Will be called with a single default argument, the homeserver.
+        *args, **kwargs: args and kwargs to be passed to the target function.
     """
-    _sighup_callbacks.append(func)
+    _sighup_callbacks.append((func, args, kwargs))
 
 
-def start_worker_reactor(appname, config):
+def start_worker_reactor(appname, config, run_command=reactor.run):
     """ Run the reactor in the main process
 
     Daemonizes if necessary, and then configures some resources, before starting
@@ -57,6 +62,7 @@ def start_worker_reactor(appname, config):
     Args:
         appname (str): application name which will be sent to syslog
         config (synapse.config.Config): config object
+        run_command (Callable[]): callable that actually runs the reactor
     """
 
     logger = logging.getLogger(config.worker_app)
@@ -69,11 +75,19 @@ def start_worker_reactor(appname, config):
         daemonize=config.worker_daemonize,
         print_pidfile=config.print_pidfile,
         logger=logger,
+        run_command=run_command,
     )
 
 
 def start_reactor(
-    appname, soft_file_limit, gc_thresholds, pid_file, daemonize, print_pidfile, logger
+    appname,
+    soft_file_limit,
+    gc_thresholds,
+    pid_file,
+    daemonize,
+    print_pidfile,
+    logger,
+    run_command=reactor.run,
 ):
     """ Run the reactor in the main process
 
@@ -88,43 +102,47 @@ def start_reactor(
         daemonize (bool): true to run the reactor in a background process
         print_pidfile (bool): whether to print the pid file, if daemonize is True
         logger (logging.Logger): logger instance to pass to Daemonize
+        run_command (Callable[]): callable that actually runs the reactor
     """
 
     install_dns_limiter(reactor)
 
     def run():
-        # make sure that we run the reactor with the sentinel log context,
-        # otherwise other PreserveLoggingContext instances will get confused
-        # and complain when they see the logcontext arbitrarily swapping
-        # between the sentinel and `run` logcontexts.
-        with PreserveLoggingContext():
-            logger.info("Running")
+        logger.info("Running")
+        change_resource_limit(soft_file_limit)
+        if gc_thresholds:
+            gc.set_threshold(*gc_thresholds)
+        run_command()
 
-            change_resource_limit(soft_file_limit)
-            if gc_thresholds:
-                gc.set_threshold(*gc_thresholds)
-            reactor.run()
+    # make sure that we run the reactor with the sentinel log context,
+    # otherwise other PreserveLoggingContext instances will get confused
+    # and complain when they see the logcontext arbitrarily swapping
+    # between the sentinel and `run` logcontexts.
+    #
+    # We also need to drop the logcontext before forking if we're daemonizing,
+    # otherwise the cputime metrics get confused about the per-thread resource usage
+    # appearing to go backwards.
+    with PreserveLoggingContext():
+        if daemonize:
+            if print_pidfile:
+                print(pid_file)
 
-    if daemonize:
-        if print_pidfile:
-            print(pid_file)
-
-        daemon = Daemonize(
-            app=appname,
-            pid=pid_file,
-            action=run,
-            auto_close_fds=False,
-            verbose=True,
-            logger=logger,
-        )
-        daemon.start()
-    else:
-        run()
+            daemon = Daemonize(
+                app=appname,
+                pid=pid_file,
+                action=run,
+                auto_close_fds=False,
+                verbose=True,
+                logger=logger,
+            )
+            daemon.start()
+        else:
+            run()
 
 
-def quit_with_error(error_string):
+def quit_with_error(error_string: str) -> NoReturn:
     message_lines = error_string.split("\n")
-    line_length = max([len(l) for l in message_lines if len(l) < 80]) + 2
+    line_length = max(len(line) for line in message_lines if len(line) < 80) + 2
     sys.stderr.write("*" * line_length + "\n")
     for line in message_lines:
         sys.stderr.write(" %s\n" % (line.rstrip(),))
@@ -136,8 +154,7 @@ def listen_metrics(bind_addresses, port):
     """
     Start Prometheus metrics server.
     """
-    from synapse.metrics import RegistryProxy
-    from prometheus_client import start_http_server
+    from synapse.metrics import RegistryProxy, start_http_server
 
     for host in bind_addresses:
         logger.info("Starting metrics listener on %s:%d", host, port)
@@ -221,6 +238,12 @@ def start(hs, listeners=None):
     """
     Start a Synapse server or worker.
 
+    Should be called once the reactor is running and (if we're using ACME) the
+    TLS certificates are in place.
+
+    Will start the main HTTP listeners and do some other startup tasks, and then
+    notify systemd.
+
     Args:
         hs (synapse.server.HomeServer)
         listeners (list[dict]): Listener configuration ('listeners' in homeserver.yaml)
@@ -230,8 +253,14 @@ def start(hs, listeners=None):
         if hasattr(signal, "SIGHUP"):
 
             def handle_sighup(*args, **kwargs):
-                for i in _sighup_callbacks:
-                    i(hs)
+                # Tell systemd our state, if we're using it. This will silently fail if
+                # we're not using systemd.
+                sdnotify(b"RELOADING=1")
+
+                for i, args, kwargs in _sighup_callbacks:
+                    i(hs, *args, **kwargs)
+
+                sdnotify(b"READY=1")
 
             signal.signal(signal.SIGHUP, handle_sighup)
 
@@ -240,11 +269,27 @@ def start(hs, listeners=None):
         # Load the certificate from disk.
         refresh_certificate(hs)
 
+        # Start the tracer
+        synapse.logging.opentracing.init_tracer(  # type: ignore[attr-defined] # noqa
+            hs
+        )
+
         # It is now safe to start your Synapse.
         hs.start_listening(listeners)
-        hs.get_datastore().start_profiling()
+        hs.get_datastore().db.start_profiling()
+        hs.get_pusherpool().start()
 
         setup_sentry(hs)
+        setup_sdnotify(hs)
+
+        # We now freeze all allocated objects in the hopes that (almost)
+        # everything currently allocated are things that will be used for the
+        # rest of time. Doing so means less work each GC (hopefully).
+        #
+        # This only works on Python 3.7
+        if sys.version_info >= (3, 7):
+            gc.collect()
+            gc.freeze()
     except Exception:
         traceback.print_exc(file=sys.stderr)
         reactor = hs.get_reactor()
@@ -272,9 +317,22 @@ def setup_sentry(hs):
         scope.set_tag("matrix_server_name", hs.config.server_name)
 
         app = hs.config.worker_app if hs.config.worker_app else "synapse.app.homeserver"
-        name = hs.config.worker_name if hs.config.worker_name else "master"
+        name = hs.get_instance_name()
         scope.set_tag("worker_app", app)
         scope.set_tag("worker_name", name)
+
+
+def setup_sdnotify(hs):
+    """Adds process state hooks to tell systemd what we are up to.
+    """
+
+    # Tell systemd our state, if we're using it. This will silently fail if
+    # we're not using systemd.
+    sdnotify(b"READY=1\nMAINPID=%i" % (os.getpid(),))
+
+    hs.get_reactor().addSystemEventTrigger(
+        "before", "shutdown", sdnotify, b"STOPPING=1"
+    )
 
 
 def install_dns_limiter(reactor, max_dns_requests_in_flight=100):
@@ -370,3 +428,35 @@ class _DeferredResolutionReceiver(object):
     def resolutionComplete(self):
         self._deferred.callback(())
         self._receiver.resolutionComplete()
+
+
+sdnotify_sockaddr = os.getenv("NOTIFY_SOCKET")
+
+
+def sdnotify(state):
+    """
+    Send a notification to systemd, if the NOTIFY_SOCKET env var is set.
+
+    This function is based on the sdnotify python package, but since it's only a few
+    lines of code, it's easier to duplicate it here than to add a dependency on a
+    package which many OSes don't include as a matter of principle.
+
+    Args:
+        state (bytes): notification to send
+    """
+    if not isinstance(state, bytes):
+        raise TypeError("sdnotify should be called with a bytes")
+    if not sdnotify_sockaddr:
+        return
+    addr = sdnotify_sockaddr
+    if addr[0] == "@":
+        addr = "\0" + addr[1:]
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(addr)
+            sock.sendall(state)
+    except Exception as e:
+        # this is a bit surprising, since we don't expect to have a NOTIFY_SOCKET
+        # unless systemd is expecting us to notify it.
+        logger.warning("Unable to send notification to systemd: %s", e)

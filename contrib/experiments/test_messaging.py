@@ -36,7 +36,7 @@ from synapse.util import origin_from_ucid
 
 from synapse.app.homeserver import SynapseHomeServer
 
-# from synapse.util.logutils import log_function
+# from synapse.logging.utils import log_function
 
 from twisted.internet import reactor, defer
 from twisted.python import log
@@ -78,7 +78,7 @@ class InputOutput(object):
             m = re.match("^join (\S+)$", line)
             if m:
                 # The `sender` wants to join a room.
-                room_name, = m.groups()
+                (room_name,) = m.groups()
                 self.print_line("%s joining %s" % (self.user, room_name))
                 self.server.join_room(room_name, self.user, self.user)
                 # self.print_line("OK.")
@@ -105,7 +105,7 @@ class InputOutput(object):
             m = re.match("^backfill (\S+)$", line)
             if m:
                 # we want to backfill a room
-                room_name, = m.groups()
+                (room_name,) = m.groups()
                 self.print_line("backfill %s" % room_name)
                 self.server.backfill(room_name)
                 return
@@ -339,7 +339,7 @@ def main(stdscr):
     root_logger = logging.getLogger()
 
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(lineno)d - " "%(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(lineno)d - %(levelname)s - %(message)s"
     )
     if not os.path.exists("logs"):
         os.makedirs("logs")

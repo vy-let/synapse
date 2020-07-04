@@ -17,11 +17,14 @@
 """Contains exceptions and error codes."""
 
 import logging
+from typing import Dict, List
 
 from six import iteritems
 from six.moves import http_client
 
 from canonicaljson import json
+
+from twisted.web import http
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,16 @@ class Codes(object):
     INCOMPATIBLE_ROOM_VERSION = "M_INCOMPATIBLE_ROOM_VERSION"
     WRONG_ROOM_KEYS_VERSION = "M_WRONG_ROOM_KEYS_VERSION"
     EXPIRED_ACCOUNT = "ORG_MATRIX_EXPIRED_ACCOUNT"
+    PASSWORD_TOO_SHORT = "M_PASSWORD_TOO_SHORT"
+    PASSWORD_NO_DIGIT = "M_PASSWORD_NO_DIGIT"
+    PASSWORD_NO_UPPERCASE = "M_PASSWORD_NO_UPPERCASE"
+    PASSWORD_NO_LOWERCASE = "M_PASSWORD_NO_LOWERCASE"
+    PASSWORD_NO_SYMBOL = "M_PASSWORD_NO_SYMBOL"
+    PASSWORD_IN_DICTIONARY = "M_PASSWORD_IN_DICTIONARY"
+    WEAK_PASSWORD = "M_WEAK_PASSWORD"
+    INVALID_SIGNATURE = "M_INVALID_SIGNATURE"
+    USER_DEACTIVATED = "M_USER_DEACTIVATED"
+    BAD_ALIAS = "M_BAD_ALIAS"
 
 
 class CodeMessageException(RuntimeError):
@@ -73,8 +86,38 @@ class CodeMessageException(RuntimeError):
 
     def __init__(self, code, msg):
         super(CodeMessageException, self).__init__("%d: %s" % (code, msg))
-        self.code = code
+
+        # Some calls to this method pass instances of http.HTTPStatus for `code`.
+        # While HTTPStatus is a subclass of int, it has magic __str__ methods
+        # which emit `HTTPStatus.FORBIDDEN` when converted to a str, instead of `403`.
+        # This causes inconsistency in our log lines.
+        #
+        # To eliminate this behaviour, we convert them to their integer equivalents here.
+        self.code = int(code)
         self.msg = msg
+
+
+class RedirectException(CodeMessageException):
+    """A pseudo-error indicating that we want to redirect the client to a different
+    location
+
+    Attributes:
+        cookies: a list of set-cookies values to add to the response. For example:
+           b"sessionId=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT"
+    """
+
+    def __init__(self, location: bytes, http_code: int = http.FOUND):
+        """
+
+        Args:
+            location: the URI to redirect to
+            http_code: the HTTP response code
+        """
+        msg = "Redirect to %s" % (location.decode("utf-8"),)
+        super().__init__(code=http_code, msg=msg)
+        self.location = location
+
+        self.cookies = []  # type: List[bytes]
 
 
 class SynapseError(CodeMessageException):
@@ -110,7 +153,7 @@ class ProxiedRequestError(SynapseError):
     def __init__(self, code, msg, errcode=Codes.UNKNOWN, additional_fields=None):
         super(ProxiedRequestError, self).__init__(code, msg, errcode)
         if additional_fields is None:
-            self._additional_fields = {}
+            self._additional_fields = {}  # type: Dict
         else:
             self._additional_fields = dict(additional_fields)
 
@@ -139,10 +182,20 @@ class ConsentNotGivenError(SynapseError):
         return cs_error(self.msg, self.errcode, consent_uri=self._consent_uri)
 
 
-class RegistrationError(SynapseError):
-    """An error raised when a registration event fails."""
+class UserDeactivatedError(SynapseError):
+    """The error returned to the client when the user attempted to access an
+    authenticated endpoint, but the account has been deactivated.
+    """
 
-    pass
+    def __init__(self, msg):
+        """Constructs a UserDeactivatedError
+
+        Args:
+            msg (str): The human-readable error message
+        """
+        super(UserDeactivatedError, self).__init__(
+            code=http_client.FORBIDDEN, msg=msg, errcode=Codes.USER_DEACTIVATED
+        )
 
 
 class FederationDeniedError(SynapseError):
@@ -210,12 +263,49 @@ class NotFoundError(SynapseError):
 
 
 class AuthError(SynapseError):
-    """An error raised when there was a problem authorising an event."""
+    """An error raised when there was a problem authorising an event, and at various
+    other poorly-defined times.
+    """
 
     def __init__(self, *args, **kwargs):
         if "errcode" not in kwargs:
             kwargs["errcode"] = Codes.FORBIDDEN
         super(AuthError, self).__init__(*args, **kwargs)
+
+
+class InvalidClientCredentialsError(SynapseError):
+    """An error raised when there was a problem with the authorisation credentials
+    in a client request.
+
+    https://matrix.org/docs/spec/client_server/r0.5.0#using-access-tokens:
+
+    When credentials are required but missing or invalid, the HTTP call will
+    return with a status of 401 and the error code, M_MISSING_TOKEN or
+    M_UNKNOWN_TOKEN respectively.
+    """
+
+    def __init__(self, msg, errcode):
+        super().__init__(code=401, msg=msg, errcode=errcode)
+
+
+class MissingClientTokenError(InvalidClientCredentialsError):
+    """Raised when we couldn't find the access token in a request"""
+
+    def __init__(self, msg="Missing access token"):
+        super().__init__(msg=msg, errcode="M_MISSING_TOKEN")
+
+
+class InvalidClientTokenError(InvalidClientCredentialsError):
+    """Raised when we didn't understand the access token in a request"""
+
+    def __init__(self, msg="Unrecognised access token", soft_logout=False):
+        super().__init__(msg=msg, errcode="M_UNKNOWN_TOKEN")
+        self._soft_logout = soft_logout
+
+    def error_dict(self):
+        d = super().error_dict()
+        d["soft_logout"] = self._soft_logout
+        return d
 
 
 class ResourceLimitError(SynapseError):
@@ -327,11 +417,9 @@ class UnsupportedRoomVersionError(SynapseError):
     """The client's request to create a room used a room version that the server does
     not support."""
 
-    def __init__(self):
+    def __init__(self, msg="Homeserver does not support this room version"):
         super(UnsupportedRoomVersionError, self).__init__(
-            code=400,
-            msg="Homeserver does not support this room version",
-            errcode=Codes.UNSUPPORTED_ROOM_VERSION,
+            code=400, msg=msg, errcode=Codes.UNSUPPORTED_ROOM_VERSION,
         )
 
 
@@ -363,6 +451,20 @@ class IncompatibleRoomVersionError(SynapseError):
 
     def error_dict(self):
         return cs_error(self.msg, self.errcode, room_version=self._room_version)
+
+
+class PasswordRefusedError(SynapseError):
+    """A password has been refused, either during password reset/change or registration.
+    """
+
+    def __init__(
+        self,
+        msg="This password doesn't comply with the server's policy",
+        errcode=Codes.WEAK_PASSWORD,
+    ):
+        super(PasswordRefusedError, self).__init__(
+            code=400, msg=msg, errcode=errcode,
+        )
 
 
 class RequestSendFailed(RuntimeError):
@@ -401,7 +503,7 @@ def cs_error(msg, code=Codes.UNKNOWN, **kwargs):
 
 
 class FederationError(RuntimeError):
-    """  This class is used to inform remote home servers about erroneous
+    """  This class is used to inform remote homeservers about erroneous
     PDUs they sent us.
 
     FATAL: The remote server could not interpret the source event.

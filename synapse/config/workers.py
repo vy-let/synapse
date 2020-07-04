@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2016 matrix.org
+# Copyright 2016 OpenMarket Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._base import Config
+import attr
+
+from ._base import Config, ConfigError
+
+
+@attr.s
+class InstanceLocationConfig:
+    """The host and port to talk to an instance via HTTP replication.
+    """
+
+    host = attr.ib(type=str)
+    port = attr.ib(type=int)
+
+
+@attr.s
+class WriterLocations:
+    """Specifies the instances that write various streams.
+
+    Attributes:
+        events: The instance that writes to the event and backfill streams.
+    """
+
+    events = attr.ib(default="master", type=str)
 
 
 class WorkerConfig(Config):
     """The workers are processes run separately to the main synapse process.
     They have their own pid_file and listener configuration. They use the
     replication_url to talk to the main synapse process."""
+
+    section = "worker"
 
     def read_config(self, config, **kwargs):
         self.worker_app = config.get("worker_app")
@@ -31,7 +55,6 @@ class WorkerConfig(Config):
         self.worker_listeners = config.get("worker_listeners", [])
         self.worker_daemonize = config.get("worker_daemonize")
         self.worker_pid_file = config.get("worker_pid_file")
-        self.worker_log_file = config.get("worker_log_file")
         self.worker_log_config = config.get("worker_log_config")
 
         # The host used to connect to the main synapse
@@ -70,6 +93,27 @@ class WorkerConfig(Config):
                 elif not bind_addresses:
                     bind_addresses.append("")
 
+        # A map from instance name to host/port of their HTTP replication endpoint.
+        instance_map = config.get("instance_map") or {}
+        self.instance_map = {
+            name: InstanceLocationConfig(**c) for name, c in instance_map.items()
+        }
+
+        # Map from type of streams to source, c.f. WriterLocations.
+        writers = config.get("stream_writers") or {}
+        self.writers = WriterLocations(**writers)
+
+        # Check that the configured writer for events also appears in
+        # `instance_map`.
+        if (
+            self.writers.events != "master"
+            and self.writers.events not in self.instance_map
+        ):
+            raise ConfigError(
+                "Instance %r is configured to write events but does not appear in `instance_map` config."
+                % (self.writers.events,)
+            )
+
     def read_arguments(self, args):
         # We support a bunch of command line arguments that override options in
         # the config. A lot of these options have a worker_* prefix when running
@@ -78,9 +122,5 @@ class WorkerConfig(Config):
 
         if args.daemonize is not None:
             self.worker_daemonize = args.daemonize
-        if args.log_config is not None:
-            self.worker_log_config = args.log_config
-        if args.log_file is not None:
-            self.worker_log_file = args.log_file
         if args.manhole is not None:
             self.worker_manhole = args.worker_manhole

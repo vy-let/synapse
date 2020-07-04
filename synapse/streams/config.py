@@ -37,7 +37,7 @@ class SourcePaginationConfig(object):
         self.limit = min(int(limit), MAX_LIMIT) if limit is not None else None
 
     def __repr__(self):
-        return ("StreamConfig(from_key=%r, to_key=%r, direction=%r, limit=%r)") % (
+        return "StreamConfig(from_key=%r, to_key=%r, direction=%r, limit=%r)" % (
             self.from_key,
             self.to_key,
             self.direction,
@@ -88,9 +88,12 @@ class PaginationConfig(object):
             raise SynapseError(400, "Invalid request.")
 
     def __repr__(self):
-        return (
-            "PaginationConfig(from_tok=%r, to_tok=%r," " direction=%r, limit=%r)"
-        ) % (self.from_token, self.to_token, self.direction, self.limit)
+        return ("PaginationConfig(from_tok=%r, to_tok=%r, direction=%r, limit=%r)") % (
+            self.from_token,
+            self.to_token,
+            self.direction,
+            self.limit,
+        )
 
     def get_source_config(self, source_name):
         keyname = "%s_key" % source_name

@@ -19,7 +19,7 @@ import random
 import sys
 from io import BytesIO
 
-from six import PY3, raise_from, string_types
+from six import raise_from, string_types
 from six.moves import urllib
 
 import attr
@@ -48,8 +48,14 @@ from synapse.api.errors import (
 from synapse.http import QuieterFileBodyProducer
 from synapse.http.client import BlacklistingAgentWrapper, IPBlacklistingResolver
 from synapse.http.federation.matrix_federation_agent import MatrixFederationAgent
+from synapse.logging.context import make_deferred_yieldable
+from synapse.logging.opentracing import (
+    inject_active_span_byte_dict,
+    set_tag,
+    start_active_span,
+    tags,
+)
 from synapse.util.async_helpers import timeout_deferred
-from synapse.util.logcontext import make_deferred_yieldable
 from synapse.util.metrics import Measure
 
 logger = logging.getLogger(__name__)
@@ -64,11 +70,7 @@ incoming_responses_counter = Counter(
 
 MAX_LONG_RETRIES = 10
 MAX_SHORT_RETRIES = 3
-
-if PY3:
-    MAXINT = sys.maxsize
-else:
-    MAXINT = sys.maxint
+MAXINT = sys.maxsize
 
 
 _next_id = 1
@@ -142,8 +144,13 @@ def _handle_json_response(reactor, timeout_sec, request, response):
         d = timeout_deferred(d, timeout=timeout_sec, reactor=reactor)
 
         body = yield make_deferred_yieldable(d)
+    except TimeoutError as e:
+        logger.warning(
+            "{%s} [%s] Timed out reading response", request.txn_id, request.destination,
+        )
+        raise RequestSendFailed(e, can_retry=True) from e
     except Exception as e:
-        logger.warn(
+        logger.warning(
             "{%s} [%s] Error reading response: %s",
             request.txn_id,
             request.destination,
@@ -157,7 +164,7 @@ def _handle_json_response(reactor, timeout_sec, request, response):
         response.code,
         response.phrase.decode("ascii", errors="replace"),
     )
-    defer.returnValue(body)
+    return body
 
 
 class MatrixFederationHttpClient(object):
@@ -255,7 +262,7 @@ class MatrixFederationHttpClient(object):
 
             response = yield self._send_request(request, **send_request_args)
 
-        defer.returnValue(response)
+        return response
 
     @defer.inlineCallbacks
     def _send_request(
@@ -339,9 +346,24 @@ class MatrixFederationHttpClient(object):
         else:
             query_bytes = b""
 
-        headers_dict = {b"User-Agent": [self.version_string_bytes]}
+        scope = start_active_span(
+            "outgoing-federation-request",
+            tags={
+                tags.SPAN_KIND: tags.SPAN_KIND_RPC_CLIENT,
+                tags.PEER_ADDRESS: request.destination,
+                tags.HTTP_METHOD: request.method,
+                tags.HTTP_URL: request.path,
+            },
+            finish_on_close=True,
+        )
 
-        with limiter:
+        # Inject the span into the headers
+        headers_dict = {}
+        inject_active_span_byte_dict(headers_dict, request.destination)
+
+        headers_dict[b"User-Agent"] = [self.version_string_bytes]
+
+        with limiter, scope:
             # XXX: Would be much nicer to retry only at the transaction-layer
             # (once we have reliable transactions in place)
             if long_retries:
@@ -387,6 +409,8 @@ class MatrixFederationHttpClient(object):
                         _sec_timeout,
                     )
 
+                    outgoing_requests_counter.labels(request.method).inc()
+
                     try:
                         with Measure(self.clock, "outbound_request"):
                             # we don't want all the fancy cookie and redirect handling
@@ -405,23 +429,37 @@ class MatrixFederationHttpClient(object):
                             )
 
                             response = yield request_deferred
+                    except TimeoutError as e:
+                        raise RequestSendFailed(e, can_retry=True) from e
                     except DNSLookupError as e:
                         raise_from(RequestSendFailed(e, can_retry=retry_on_dns_fail), e)
                     except Exception as e:
                         logger.info("Failed to send request: %s", e)
                         raise_from(RequestSendFailed(e, can_retry=True), e)
 
-                    logger.info(
-                        "{%s} [%s] Got response headers: %d %s",
-                        request.txn_id,
-                        request.destination,
-                        response.code,
-                        response.phrase.decode("ascii", errors="replace"),
-                    )
+                    incoming_responses_counter.labels(
+                        request.method, response.code
+                    ).inc()
+
+                    set_tag(tags.HTTP_STATUS_CODE, response.code)
 
                     if 200 <= response.code < 300:
+                        logger.debug(
+                            "{%s} [%s] Got response headers: %d %s",
+                            request.txn_id,
+                            request.destination,
+                            response.code,
+                            response.phrase.decode("ascii", errors="replace"),
+                        )
                         pass
                     else:
+                        logger.info(
+                            "{%s} [%s] Got response headers: %d %s",
+                            request.txn_id,
+                            request.destination,
+                            response.code,
+                            response.phrase.decode("ascii", errors="replace"),
+                        )
                         # :'(
                         # Update transactions table?
                         d = treq.content(response)
@@ -434,7 +472,7 @@ class MatrixFederationHttpClient(object):
                         except Exception as e:
                             # Eh, we're already going to raise an exception so lets
                             # ignore if this fails.
-                            logger.warn(
+                            logger.warning(
                                 "{%s} [%s] Failed to get error response: %s %s: %s",
                                 request.txn_id,
                                 request.destination,
@@ -455,7 +493,7 @@ class MatrixFederationHttpClient(object):
 
                     break
                 except RequestSendFailed as e:
-                    logger.warn(
+                    logger.warning(
                         "{%s} [%s] Request failed: %s %s: %s",
                         request.txn_id,
                         request.destination,
@@ -490,7 +528,7 @@ class MatrixFederationHttpClient(object):
                         raise
 
                 except Exception as e:
-                    logger.warn(
+                    logger.warning(
                         "{%s} [%s] Request failed: %s %s: %s",
                         request.txn_id,
                         request.destination,
@@ -499,8 +537,7 @@ class MatrixFederationHttpClient(object):
                         _flatten_response_never_received(e),
                     )
                     raise
-
-            defer.returnValue(response)
+        return response
 
     def build_auth_headers(
         self, destination, method, url_bytes, content=None, destination_is=None
@@ -508,7 +545,7 @@ class MatrixFederationHttpClient(object):
         """
         Builds the Authorization headers for a federation request
         Args:
-            destination (bytes|None): The desination home server of the request.
+            destination (bytes|None): The desination homeserver of the request.
                 May be None if the destination is an identity server, in which case
                 destination_is must be non-None.
             method (bytes): The HTTP method of the request
@@ -624,7 +661,7 @@ class MatrixFederationHttpClient(object):
             self.reactor, self.default_timeout, request, response
         )
 
-        defer.returnValue(body)
+        return body
 
     @defer.inlineCallbacks
     def post_json(
@@ -693,7 +730,7 @@ class MatrixFederationHttpClient(object):
         body = yield _handle_json_response(
             self.reactor, _sec_timeout, request, response
         )
-        defer.returnValue(body)
+        return body
 
     @defer.inlineCallbacks
     def get_json(
@@ -758,7 +795,7 @@ class MatrixFederationHttpClient(object):
             self.reactor, self.default_timeout, request, response
         )
 
-        defer.returnValue(body)
+        return body
 
     @defer.inlineCallbacks
     def delete_json(
@@ -816,7 +853,7 @@ class MatrixFederationHttpClient(object):
         body = yield _handle_json_response(
             self.reactor, self.default_timeout, request, response
         )
-        defer.returnValue(body)
+        return body
 
     @defer.inlineCallbacks
     def get_file(
@@ -867,7 +904,7 @@ class MatrixFederationHttpClient(object):
             d.addTimeout(self.default_timeout, self.reactor)
             length = yield make_deferred_yieldable(d)
         except Exception as e:
-            logger.warn(
+            logger.warning(
                 "{%s} [%s] Error reading response: %s",
                 request.txn_id,
                 request.destination,
@@ -882,7 +919,7 @@ class MatrixFederationHttpClient(object):
             response.phrase.decode("ascii", errors="replace"),
             length,
         )
-        defer.returnValue((length, headers))
+        return (length, headers)
 
 
 class _ReadBodyToFileProtocol(protocol.Protocol):

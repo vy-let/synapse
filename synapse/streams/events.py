@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any, Dict
+
 from twisted.internet import defer
 
 from synapse.handlers.account_data import AccountDataEventSource
@@ -35,7 +37,7 @@ class EventSources(object):
     def __init__(self, hs):
         self.sources = {
             name: cls(hs) for name, cls in EventSources.SOURCE_TYPES.items()
-        }
+        }  # type: Dict[str, Any]
         self.store = hs.get_datastore()
 
     @defer.inlineCallbacks
@@ -56,7 +58,7 @@ class EventSources(object):
             device_list_key=device_list_key,
             groups_key=groups_key,
         )
-        defer.returnValue(token)
+        return token
 
     @defer.inlineCallbacks
     def get_current_token_for_pagination(self):
@@ -80,4 +82,4 @@ class EventSources(object):
             device_list_key=0,
             groups_key=0,
         )
-        defer.returnValue(token)
+        return token

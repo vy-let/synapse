@@ -20,8 +20,7 @@ import shutil
 from twisted.internet import defer
 
 from synapse.config._base import Config
-from synapse.util import logcontext
-from synapse.util.logcontext import run_in_background
+from synapse.logging.context import defer_to_thread, run_in_background
 
 from .media_storage import FileResponder
 
@@ -68,7 +67,7 @@ class StorageProviderWrapper(StorageProvider):
         backend (StorageProvider)
         store_local (bool): Whether to store new local files or not.
         store_synchronous (bool): Whether to wait for file to be successfully
-            uploaded, or todo the upload in the backgroud.
+            uploaded, or todo the upload in the background.
         store_remote (bool): Whether remote media should be uploaded
     """
 
@@ -77,6 +76,9 @@ class StorageProviderWrapper(StorageProvider):
         self.store_local = store_local
         self.store_synchronous = store_synchronous
         self.store_remote = store_remote
+
+    def __str__(self):
+        return "StorageProviderWrapper[%s]" % (self.backend,)
 
     def store_file(self, path, file_info):
         if not file_info.server_name and not self.store_local:
@@ -115,6 +117,9 @@ class FileStorageProviderBackend(StorageProvider):
         self.cache_directory = hs.config.media_store_path
         self.base_directory = config
 
+    def __str__(self):
+        return "FileStorageProviderBackend[%s]" % (self.base_directory,)
+
     def store_file(self, path, file_info):
         """See StorageProvider.store_file"""
 
@@ -125,7 +130,7 @@ class FileStorageProviderBackend(StorageProvider):
         if not os.path.exists(dirname):
             os.makedirs(dirname)
 
-        return logcontext.defer_to_thread(
+        return defer_to_thread(
             self.hs.get_reactor(), shutil.copyfile, primary_fname, backup_fname
         )
 

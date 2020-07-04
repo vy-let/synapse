@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import collections
 import re
+from typing import Any, Mapping, Union
 
 from six import string_types
 
@@ -22,6 +23,8 @@ from frozendict import frozendict
 from twisted.internet import defer
 
 from synapse.api.constants import EventTypes, RelationTypes
+from synapse.api.errors import Codes, SynapseError
+from synapse.api.room_versions import RoomVersion
 from synapse.util.async_helpers import yieldable_gather_results
 
 from . import EventBase
@@ -34,38 +37,34 @@ from . import EventBase
 SPLIT_FIELD_REGEX = re.compile(r"(?<!\\)\.")
 
 
-def prune_event(event):
+def prune_event(event: EventBase) -> EventBase:
     """ Returns a pruned version of the given event, which removes all keys we
     don't know about or think could potentially be dodgy.
 
     This is used when we "redact" an event. We want to remove all fields that
     the user has specified, but we do want to keep necessary information like
     type, state_key etc.
-
-    Args:
-        event (FrozenEvent)
-
-    Returns:
-        FrozenEvent
     """
-    pruned_event_dict = prune_event_dict(event.get_dict())
+    pruned_event_dict = prune_event_dict(event.room_version, event.get_dict())
 
-    from . import event_type_from_format_version
+    from . import make_event_from_dict
 
-    return event_type_from_format_version(event.format_version)(
-        pruned_event_dict, event.internal_metadata.get_dict()
+    pruned_event = make_event_from_dict(
+        pruned_event_dict, event.room_version, event.internal_metadata.get_dict()
     )
 
+    # Mark the event as redacted
+    pruned_event.internal_metadata.redacted = True
 
-def prune_event_dict(event_dict):
+    return pruned_event
+
+
+def prune_event_dict(room_version: RoomVersion, event_dict: dict) -> dict:
     """Redacts the event_dict in the same way as `prune_event`, except it
     operates on dicts rather than event objects
 
-    Args:
-        event_dict (dict)
-
     Returns:
-        dict: A copy of the pruned event dict
+        A copy of the pruned event dict
     """
 
     allowed_keys = [
@@ -112,7 +111,7 @@ def prune_event_dict(event_dict):
             "kick",
             "redact",
         )
-    elif event_type == EventTypes.Aliases:
+    elif event_type == EventTypes.Aliases and room_version.special_case_aliases_auth:
         add_fields("aliases")
     elif event_type == EventTypes.RoomHistoryVisibility:
         add_fields("history_visibility")
@@ -355,14 +354,17 @@ class EventClientSerializer(object):
         """
         # To handle the case of presence events and the like
         if not isinstance(event, EventBase):
-            defer.returnValue(event)
+            return event
 
         event_id = event.event_id
         serialized_event = serialize_event(event, time_now, **kwargs)
 
-        # If MSC1849 is enabled then we need to look if thre are any relations
-        # we need to bundle in with the event
-        if self.experimental_msc1849_support_enabled and bundle_aggregations:
+        # If MSC1849 is enabled then we need to look if there are any relations
+        # we need to bundle in with the event.
+        # Do not bundle relations if the event has been redacted
+        if not event.internal_metadata.is_redacted() and (
+            self.experimental_msc1849_support_enabled and bundle_aggregations
+        ):
             annotations = yield self.store.get_aggregation_groups_for_event(event_id)
             references = yield self.store.get_relations_for_event(
                 event_id, RelationTypes.REFERENCE, direction="f"
@@ -392,9 +394,13 @@ class EventClientSerializer(object):
                     serialized_event["content"].pop("m.relates_to", None)
 
                 r = serialized_event["unsigned"].setdefault("m.relations", {})
-                r[RelationTypes.REPLACE] = {"event_id": edit.event_id}
+                r[RelationTypes.REPLACE] = {
+                    "event_id": edit.event_id,
+                    "origin_server_ts": edit.origin_server_ts,
+                    "sender": edit.sender,
+                }
 
-        defer.returnValue(serialized_event)
+        return serialized_event
 
     def serialize_events(self, events, time_now, **kwargs):
         """Serializes multiple events.
@@ -410,3 +416,69 @@ class EventClientSerializer(object):
         return yieldable_gather_results(
             self.serialize_event, events, time_now=time_now, **kwargs
         )
+
+
+def copy_power_levels_contents(
+    old_power_levels: Mapping[str, Union[int, Mapping[str, int]]]
+):
+    """Copy the content of a power_levels event, unfreezing frozendicts along the way
+
+    Raises:
+        TypeError if the input does not look like a valid power levels event content
+    """
+    if not isinstance(old_power_levels, collections.Mapping):
+        raise TypeError("Not a valid power-levels content: %r" % (old_power_levels,))
+
+    power_levels = {}
+    for k, v in old_power_levels.items():
+
+        if isinstance(v, int):
+            power_levels[k] = v
+            continue
+
+        if isinstance(v, collections.Mapping):
+            power_levels[k] = h = {}
+            for k1, v1 in v.items():
+                # we should only have one level of nesting
+                if not isinstance(v1, int):
+                    raise TypeError(
+                        "Invalid power_levels value for %s.%s: %r" % (k, k1, v1)
+                    )
+                h[k1] = v1
+            continue
+
+        raise TypeError("Invalid power_levels value for %s: %r" % (k, v))
+
+    return power_levels
+
+
+def validate_canonicaljson(value: Any):
+    """
+    Ensure that the JSON object is valid according to the rules of canonical JSON.
+
+    See the appendix section 3.1: Canonical JSON.
+
+    This rejects JSON that has:
+    * An integer outside the range of [-2 ^ 53 + 1, 2 ^ 53 - 1]
+    * Floats
+    * NaN, Infinity, -Infinity
+    """
+    if isinstance(value, int):
+        if value <= -(2 ** 53) or 2 ** 53 <= value:
+            raise SynapseError(400, "JSON integer out of range", Codes.BAD_JSON)
+
+    elif isinstance(value, float):
+        # Note that Infinity, -Infinity, and NaN are also considered floats.
+        raise SynapseError(400, "Bad JSON value: float", Codes.BAD_JSON)
+
+    elif isinstance(value, (dict, frozendict)):
+        for v in value.values():
+            validate_canonicaljson(v)
+
+    elif isinstance(value, (list, tuple)):
+        for i in value:
+            validate_canonicaljson(i)
+
+    elif not isinstance(value, (bool, str)) and value is not None:
+        # Other potential JSON values (bool, None, str) are safe.
+        raise SynapseError(400, "Unknown JSON value", Codes.BAD_JSON)

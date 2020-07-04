@@ -1,3 +1,11 @@
+================
+Synapse |shield|
+================
+
+.. |shield| image:: https://img.shields.io/matrix/synapse:matrix.org?label=support&logo=matrix
+  :alt: (get support on #synapse:matrix.org)
+  :target: https://matrix.to/#/#synapse:matrix.org
+
 .. contents::
 
 Introduction
@@ -77,6 +85,17 @@ Thanks for using Matrix!
 [1] End-to-end encryption is currently in beta: `blog post <https://matrix.org/blog/2016/11/21/matrixs-olm-end-to-end-encryption-security-assessment-released-and-implemented-cross-platform-on-riot-at-last>`_.
 
 
+Support
+=======
+
+For support installing or managing Synapse, please join |room|_ (from a matrix.org
+account if necessary) and ask questions there. We do not use GitHub issues for
+support requests, only for bug reports and feature requests.
+
+.. |room| replace:: ``#synapse:matrix.org``
+.. _room: https://matrix.to/#/#synapse:matrix.org
+
+
 Synapse Installation
 ====================
 
@@ -115,7 +134,7 @@ Registering a new user from a client
 
 By default, registration of new users via Matrix clients is disabled. To enable
 it, specify ``enable_registration: true`` in ``homeserver.yaml``. (It is then
-recommended to also set up CAPTCHA - see `<docs/CAPTCHA_SETUP.rst>`_.)
+recommended to also set up CAPTCHA - see `<docs/CAPTCHA_SETUP.md>`_.)
 
 Once ``enable_registration`` is set to ``true``, it is possible to register a
 user via `riot.im <https://riot.im/app/#/register>`_ or other Matrix clients.
@@ -186,7 +205,7 @@ Almost all installations should opt to use PostreSQL. Advantages include:
   synapse itself.
 
 For information on how to install and use PostgreSQL, please see
-`docs/postgres.rst <docs/postgres.rst>`_.
+`docs/postgres.md <docs/postgres.md>`_.
 
 .. _reverse-proxy:
 
@@ -201,7 +220,7 @@ It is recommended to put a reverse proxy such as
 doing so is that it means that you can expose the default https port (443) to
 Matrix clients without needing to run Synapse with root privileges.
 
-For information on configuring one, see `<docs/reverse_proxy.rst>`_.
+For information on configuring one, see `<docs/reverse_proxy.md>`_.
 
 Identity Servers
 ================
@@ -248,7 +267,7 @@ First calculate the hash of the new password::
     Confirm password:
     $2a$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-Then update the `users` table in the database::
+Then update the ``users`` table in the database::
 
     UPDATE users SET password_hash='$2a$12$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
         WHERE name='@test:test.com';
@@ -272,7 +291,7 @@ to install using pip and a virtualenv::
 
     virtualenv -p python3 env
     source env/bin/activate
-    python -m pip install --no-pep-517 -e .[all]
+    python -m pip install --no-use-pep517 -e ".[all]"
 
 This will run a process of downloading and installing all the needed
 dependencies into a virtual env.
@@ -315,6 +334,9 @@ Building internal API documentation::
 
 Troubleshooting
 ===============
+
+Need help? Join our community support room on Matrix:
+`#synapse:matrix.org <https://matrix.to/#/#synapse:matrix.org>`_
 
 Running out of File Handles
 ---------------------------
@@ -381,3 +403,16 @@ indicate that your server is also issuing far more outgoing federation
 requests than can be accounted for by your users' activity, this is a
 likely cause. The misbehavior can be worked around by setting
 ``use_presence: false`` in the Synapse config file.
+
+People can't accept room invitations from me
+--------------------------------------------
+
+The typical failure mode here is that you send an invitation to someone 
+to join a room or direct chat, but when they go to accept it, they get an
+error (typically along the lines of "Invalid signature"). They might see
+something like the following in their logs::
+
+    2019-09-11 19:32:04,271 - synapse.federation.transport.server - 288 - WARNING - GET-11752 - authenticate_request failed: 401: Invalid signature for server <server> with key ed25519:a_EqML: Unable to verify signature for <server>
+
+This is normally caused by a misconfiguration in your reverse-proxy. See
+`<docs/reverse_proxy.md>`_ and double-check that your settings are correct.
