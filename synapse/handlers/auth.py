@@ -18,10 +18,20 @@ import logging
 import time
 import unicodedata
 import urllib.parse
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import attr
-import bcrypt  # type: ignore[import]
+import bcrypt
 import pymacaroons
 
 from synapse.api.constants import LoginType
@@ -48,6 +58,9 @@ from synapse.util.msisdn import phone_number_to_msisdn
 from synapse.util.threepids import canonicalise_email
 
 from ._base import BaseHandler
+
+if TYPE_CHECKING:
+    from synapse.app.homeserver import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +162,7 @@ class SsoLoginExtraAttributes:
 class AuthHandler(BaseHandler):
     SESSION_EXPIRE_MS = 48 * 60 * 60 * 1000
 
-    def __init__(self, hs):
-        """
-        Args:
-            hs (synapse.server.HomeServer):
-        """
+    def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
 
         self.checkers = {}  # type: Dict[str, UserInteractiveAuthChecker]
@@ -164,11 +173,23 @@ class AuthHandler(BaseHandler):
 
         self.bcrypt_rounds = hs.config.bcrypt_rounds
 
+        # we can't use hs.get_module_api() here, because to do so will create an
+        # import loop.
+        #
+        # TODO: refactor this class to separate the lower-level stuff that
+        #   ModuleApi can use from the higher-level stuff that uses ModuleApi, as
+        #   better way to break the loop
         account_handler = ModuleApi(hs, self)
-        self.password_providers = [
-            module(config=config, account_handler=account_handler)
-            for module, config in hs.config.password_providers
-        ]
+
+        self.password_providers = []
+        for module, config in hs.config.password_providers:
+            try:
+                self.password_providers.append(
+                    module(config=config, account_handler=account_handler)
+                )
+            except Exception as e:
+                logger.error("Error while initializing %r: %s", module, e)
+                raise
 
         logger.info("Extra password_providers: %r", self.password_providers)
 
@@ -212,7 +233,7 @@ class AuthHandler(BaseHandler):
         self._clock = self.hs.get_clock()
 
         # Expire old UI auth sessions after a period of time.
-        if hs.config.worker_app is None:
+        if hs.config.run_background_tasks:
             self._clock.looping_call(
                 run_as_background_process,
                 5 * 60 * 1000,
@@ -463,9 +484,7 @@ class AuthHandler(BaseHandler):
             # authentication flow.
             await self.store.set_ui_auth_clientdict(sid, clientdict)
 
-        user_agent = request.requestHeaders.getRawHeaders(b"User-Agent", default=[b""])[
-            0
-        ].decode("ascii", "surrogateescape")
+        user_agent = request.get_user_agent("")
 
         await self.store.add_user_agent_ip_to_ui_auth_session(
             session.session_id, user_agent, clientip
@@ -685,7 +704,7 @@ class AuthHandler(BaseHandler):
         Creates a new access token for the user with the given user ID.
 
         The user is assumed to have been authenticated by some other
-        machanism (e.g. CAS), and the user_id converted to the canonical case.
+        mechanism (e.g. CAS), and the user_id converted to the canonical case.
 
         The device will be recorded in the table if it is not there already.
 
@@ -977,17 +996,17 @@ class AuthHandler(BaseHandler):
                 # This might return an awaitable, if it does block the log out
                 # until it completes.
                 result = provider.on_logged_out(
-                    user_id=str(user_info["user"]),
-                    device_id=user_info["device_id"],
+                    user_id=user_info.user_id,
+                    device_id=user_info.device_id,
                     access_token=access_token,
                 )
                 if inspect.isawaitable(result):
                     await result
 
         # delete pushers associated with this access token
-        if user_info["token_id"] is not None:
+        if user_info.token_id is not None:
             await self.hs.get_pusherpool().remove_pushers_by_access_token(
-                str(user_info["user"]), (user_info["token_id"],)
+                user_info.user_id, (user_info.token_id,)
             )
 
     async def delete_access_tokens_for_user(
@@ -1073,7 +1092,7 @@ class AuthHandler(BaseHandler):
         if medium == "email":
             address = canonicalise_email(address)
 
-        identity_handler = self.hs.get_handlers().identity_handler
+        identity_handler = self.hs.get_identity_handler()
         result = await identity_handler.try_unbind_threepid(
             user_id, {"medium": medium, "address": address, "id_server": id_server}
         )
@@ -1115,20 +1134,22 @@ class AuthHandler(BaseHandler):
             Whether self.hash(password) == stored_hash.
         """
 
-        def _do_validate_hash():
+        def _do_validate_hash(checked_hash: bytes):
             # Normalise the Unicode in the password
             pw = unicodedata.normalize("NFKC", password)
 
             return bcrypt.checkpw(
                 pw.encode("utf8") + self.hs.config.password_pepper.encode("utf8"),
-                stored_hash,
+                checked_hash,
             )
 
         if stored_hash:
             if not isinstance(stored_hash, bytes):
                 stored_hash = stored_hash.encode("ascii")
 
-            return await defer_to_thread(self.hs.get_reactor(), _do_validate_hash)
+            return await defer_to_thread(
+                self.hs.get_reactor(), _do_validate_hash, stored_hash
+            )
         else:
             return False
 

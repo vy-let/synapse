@@ -38,6 +38,7 @@ from synapse.http.servlet import (
     parse_json_object_from_request,
     parse_string,
 )
+from synapse.metrics import threepid_send_requests
 from synapse.push.mailer import Mailer
 from synapse.util.msisdn import phone_number_to_msisdn
 from synapse.util.stringutils import assert_valid_client_secret, random_string
@@ -56,7 +57,7 @@ class EmailPasswordRequestTokenRestServlet(RestServlet):
         self.hs = hs
         self.datastore = hs.get_datastore()
         self.config = hs.config
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
 
         if self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
             self.mailer = Mailer(
@@ -142,6 +143,10 @@ class EmailPasswordRequestTokenRestServlet(RestServlet):
 
             # Wrap the session id in a JSON object
             ret = {"sid": sid}
+
+        threepid_send_requests.labels(type="email", reason="password_reset").observe(
+            send_attempt
+        )
 
         return 200, ret
 
@@ -268,9 +273,6 @@ class PasswordRestServlet(RestServlet):
 
         return 200, {}
 
-    def on_OPTIONS(self, _):
-        return 200, {}
-
 
 class DeactivateAccountRestServlet(RestServlet):
     PATTERNS = client_patterns("/account/deactivate$")
@@ -327,7 +329,7 @@ class EmailThreepidRequestTokenRestServlet(RestServlet):
         super().__init__()
         self.hs = hs
         self.config = hs.config
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
         self.store = self.hs.get_datastore()
 
         if self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
@@ -414,6 +416,10 @@ class EmailThreepidRequestTokenRestServlet(RestServlet):
             # Wrap the session id in a JSON object
             ret = {"sid": sid}
 
+        threepid_send_requests.labels(type="email", reason="add_threepid").observe(
+            send_attempt
+        )
+
         return 200, ret
 
 
@@ -424,7 +430,7 @@ class MsisdnThreepidRequestTokenRestServlet(RestServlet):
         self.hs = hs
         super().__init__()
         self.store = self.hs.get_datastore()
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
 
     async def on_POST(self, request):
         body = parse_json_object_from_request(request)
@@ -482,6 +488,10 @@ class MsisdnThreepidRequestTokenRestServlet(RestServlet):
             client_secret,
             send_attempt,
             next_link,
+        )
+
+        threepid_send_requests.labels(type="msisdn", reason="add_threepid").observe(
+            send_attempt
         )
 
         return 200, ret
@@ -574,7 +584,7 @@ class AddThreepidMsisdnSubmitTokenServlet(RestServlet):
         self.config = hs.config
         self.clock = hs.get_clock()
         self.store = hs.get_datastore()
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
 
     async def on_POST(self, request):
         if not self.config.account_threepid_delegate_msisdn:
@@ -604,7 +614,7 @@ class ThreepidRestServlet(RestServlet):
     def __init__(self, hs):
         super().__init__()
         self.hs = hs
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
         self.auth = hs.get_auth()
         self.auth_handler = hs.get_auth_handler()
         self.datastore = self.hs.get_datastore()
@@ -660,7 +670,7 @@ class ThreepidAddRestServlet(RestServlet):
     def __init__(self, hs):
         super().__init__()
         self.hs = hs
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
         self.auth = hs.get_auth()
         self.auth_handler = hs.get_auth_handler()
 
@@ -711,7 +721,7 @@ class ThreepidBindRestServlet(RestServlet):
     def __init__(self, hs):
         super().__init__()
         self.hs = hs
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
         self.auth = hs.get_auth()
 
     async def on_POST(self, request):
@@ -740,7 +750,7 @@ class ThreepidUnbindRestServlet(RestServlet):
     def __init__(self, hs):
         super().__init__()
         self.hs = hs
-        self.identity_handler = hs.get_handlers().identity_handler
+        self.identity_handler = hs.get_identity_handler()
         self.auth = hs.get_auth()
         self.datastore = self.hs.get_datastore()
 

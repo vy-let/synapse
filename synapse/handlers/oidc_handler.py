@@ -96,6 +96,7 @@ class OidcHandler:
         self.hs = hs
         self._callback_url = hs.config.oidc_callback_url  # type: str
         self._scopes = hs.config.oidc_scopes  # type: List[str]
+        self._user_profile_method = hs.config.oidc_user_profile_method  # type: str
         self._client_auth = ClientAuth(
             hs.config.oidc_client_id,
             hs.config.oidc_client_secret,
@@ -196,11 +197,11 @@ class OidcHandler:
                     % (m["response_types_supported"],)
                 )
 
-        # If the openid scope was not requested, we need a userinfo endpoint to fetch user infos
+        # Ensure there's a userinfo endpoint to fetch from if it is required.
         if self._uses_userinfo:
             if m.get("userinfo_endpoint") is None:
                 raise ValueError(
-                    'provider has no "userinfo_endpoint", even though it is required because the "openid" scope is not requested'
+                    'provider has no "userinfo_endpoint", even though it is required'
                 )
         else:
             # If we're not using userinfo, we need a valid jwks to validate the ID token
@@ -216,12 +217,14 @@ class OidcHandler:
 
         This is based on the requested scopes: if the scopes include
         ``openid``, the provider should give use an ID token containing the
-        user informations. If not, we should fetch them using the
+        user information. If not, we should fetch them using the
         ``access_token`` with the ``userinfo_endpoint``.
         """
 
-        # Maybe that should be user-configurable and not inferred?
-        return "openid" not in self._scopes
+        return (
+            "openid" not in self._scopes
+            or self._user_profile_method == "userinfo_endpoint"
+        )
 
     async def load_metadata(self) -> OpenIDProviderMetadata:
         """Load and validate the provider metadata.
@@ -423,7 +426,7 @@ class OidcHandler:
         return resp
 
     async def _fetch_userinfo(self, token: Token) -> UserInfo:
-        """Fetch user informations from the ``userinfo_endpoint``.
+        """Fetch user information from the ``userinfo_endpoint``.
 
         Args:
             token: the token given by the ``token_endpoint``.
@@ -692,9 +695,7 @@ class OidcHandler:
                 return
 
         # Pull out the user-agent and IP from the request.
-        user_agent = request.requestHeaders.getRawHeaders(b"User-Agent", default=[b""])[
-            0
-        ].decode("ascii", "surrogateescape")
+        user_agent = request.get_user_agent("")
         ip_address = self.hs.get_ip_from_request(request)
 
         # Call the mapper to register/login the user
@@ -753,7 +754,7 @@ class OidcHandler:
                 Defaults to an hour.
 
         Returns:
-            A signed macaroon token with the session informations.
+            A signed macaroon token with the session information.
         """
         macaroon = pymacaroons.Macaroon(
             location=self._server_name, identifier="key", key=self._macaroon_secret_key,

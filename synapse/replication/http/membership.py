@@ -47,7 +47,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
     def __init__(self, hs):
         super().__init__(hs)
 
-        self.federation_handler = hs.get_handlers().federation_handler
+        self.federation_handler = hs.get_federation_handler()
         self.store = hs.get_datastore()
         self.clock = hs.get_clock()
 
@@ -77,8 +77,7 @@ class ReplicationRemoteJoinRestServlet(ReplicationEndpoint):
 
         requester = Requester.deserialize(self.store, content["requester"])
 
-        if requester.user:
-            request.authenticated_entity = requester.user.to_string()
+        request.requester = requester
 
         logger.info("remote_join: %s into room: %s", user_id, room_id)
 
@@ -142,8 +141,7 @@ class ReplicationRemoteRejectInviteRestServlet(ReplicationEndpoint):
 
         requester = Requester.deserialize(self.store, content["requester"])
 
-        if requester.user:
-            request.authenticated_entity = requester.user.to_string()
+        request.requester = requester
 
         # hopefully we're now on the master, so this won't recurse!
         event_id, stream_id = await self.member_handler.remote_reject_invite(

@@ -67,7 +67,6 @@ class LoginRestServlet(RestServlet):
 
         self.auth_handler = self.hs.get_auth_handler()
         self.registration_handler = hs.get_registration_handler()
-        self.handlers = hs.get_handlers()
         self._well_known_builder = WellKnownBuilder(hs)
         self._address_ratelimiter = Ratelimiter(
             clock=hs.get_clock(),
@@ -111,10 +110,9 @@ class LoginRestServlet(RestServlet):
             ({"type": t} for t in self.auth_handler.get_supported_login_types())
         )
 
-        return 200, {"flows": flows}
+        flows.append({"type": LoginRestServlet.APPSERVICE_TYPE})
 
-    def on_OPTIONS(self, request: SynapseRequest):
-        return 200, {}
+        return 200, {"flows": flows}
 
     async def on_POST(self, request: SynapseRequest):
         self._address_ratelimiter.ratelimit(request.getClientIP())
